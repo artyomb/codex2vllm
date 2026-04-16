@@ -1,0 +1,11 @@
+services:
+  codex2vllm:
+    image: ${REGISTRY_HOST}/codex2vllm
+#    image: ${REGISTRY_HOST}/codex2vllm:dev-${GITHUB_REF_NAME}
+    build:
+      context: ../src
+      dockerfile: ../docker/ruby/Dockerfile
+      cache_from:
+        - type=gha,scope=codex2vllm
+      cache_to:
+        - type=gha,scope=codex2vllm,mode=max
