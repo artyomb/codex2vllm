@@ -21,6 +21,8 @@ class Qwen3CoderToolCallShim < Sinatra::Base
   ].freeze
 
   SYSTEM_ROLES = %w[developer system].freeze
+  SUPPORTED_INPUT_ITEM_TYPES = %w[message reasoning function_call function_call_output].freeze
+  SUPPORTED_MESSAGE_ROLES = %w[user assistant developer system].freeze
   MCP_RESOURCE_TOOL_NAMES = %w[list_mcp_resources list_mcp_resource_templates read_mcp_resource].freeze
   ALWAYS_DEDUPED_TOOL_NAMES = %w[update_plan].freeze
   TEXT_PART_TYPES = %w[input_text output_text text].freeze
@@ -206,6 +208,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     normalized_items = collapse_duplicate_tool_history_items(normalized_items, dropped_items, payload["model"])
 
     payload["input"] = normalized_items
+    payload = strip_nil_values(payload)
     log_dropped_items(dropped_items) if dropped_items.any?
     log_debug "normalized input roles/types=#{payload["input"].map { |item| item["role"] || item["type"] }.inspect}"
     log_debug "normalized input tail=#{JSON.generate(payload["input"].last(4))[0..4000]}" if payload["input"].length > 2
@@ -372,9 +375,14 @@ class Qwen3CoderToolCallShim < Sinatra::Base
   end
 
   def normalize_input_item(item, invalid_function_call_ids = nil)
-    return item unless item.is_a?(Hash)
+    return nil unless item.is_a?(Hash)
 
-    case item["type"]
+    type = item["type"].to_s
+    if !type.empty? && !SUPPORTED_INPUT_ITEM_TYPES.include?(type)
+      return nil
+    end
+
+    case type
     when "reasoning"
       normalize_reasoning_input_item(item)
     when "message"
@@ -402,7 +410,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     return nil if blank_assistant_message?(item)
 
     item["id"] ||= "msg_#{SecureRandom.hex(8)}"
-    item["status"] ||= "in_progress"
+    item["status"] = "completed"
 
     Array(item["content"]).each do |content|
       next unless content.is_a?(Hash) && content["type"] == "output_text"
@@ -459,10 +467,16 @@ class Qwen3CoderToolCallShim < Sinatra::Base
 
   def normalize_role_input_item(item)
     item = strip_nil_values(item.dup)
+    return nil unless SUPPORTED_MESSAGE_ROLES.include?(item["role"].to_s)
+
     item["role"] = "system" if item["role"] == "developer"
 
     return item unless item["role"] == "assistant" && item["content"].is_a?(Array)
     return nil if blank_assistant_message?(item)
+
+    item["type"] ||= "message"
+    item["id"] ||= "msg_#{SecureRandom.hex(8)}"
+    item["status"] = "completed"
 
     Array(item["content"]).each do |content|
       next unless content.is_a?(Hash) && content["type"] == "output_text"
