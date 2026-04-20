@@ -22,6 +22,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
 
   SYSTEM_ROLES = %w[developer system].freeze
   MCP_RESOURCE_TOOL_NAMES = %w[list_mcp_resources list_mcp_resource_templates read_mcp_resource].freeze
+  ALWAYS_DEDUPED_TOOL_NAMES = %w[update_plan].freeze
   TEXT_PART_TYPES = %w[input_text output_text text].freeze
   TRACE_PREVIEW_LIMIT = 2_000
   COMPATIBILITY_INSTRUCTIONS = <<~TEXT.freeze
@@ -202,6 +203,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     end
 
     normalized_items = prune_transient_history_items(normalized_items, dropped_items)
+    normalized_items = collapse_duplicate_tool_history_items(normalized_items, dropped_items, payload["model"])
 
     payload["input"] = normalized_items
     log_dropped_items(dropped_items) if dropped_items.any?
@@ -283,6 +285,64 @@ class Qwen3CoderToolCallShim < Sinatra::Base
 
       item
     end
+  end
+
+  def collapse_duplicate_tool_history_items(items, dropped_items, model_name = nil)
+    duplicate_call_ids = {}
+    deduped_items = []
+    index = 0
+
+    while index < items.length
+      item = items[index]
+
+      if collapsible_duplicate_tool_call?(item, model_name)
+        deduped_items << item
+        index += 1
+
+        while index < items.length && duplicate_tool_call?(item, items[index], model_name)
+          duplicate_item = items[index]
+          duplicate_call_ids[duplicate_item["call_id"].to_s] = true
+          dropped_items << duplicate_item
+          index += 1
+        end
+
+        next
+      end
+
+      if item.is_a?(Hash) && item["type"] == "function_call_output" && duplicate_call_ids[item["call_id"].to_s]
+        dropped_items << item
+        index += 1
+        next
+      end
+
+      deduped_items << item
+      index += 1
+    end
+
+    deduped_items
+  end
+
+  def collapsible_duplicate_tool_call?(item, model_name = nil)
+    item.is_a?(Hash) &&
+      item["type"] == "function_call" &&
+      duplicate_tool_dedupe_enabled?(item["name"], model_name) &&
+      !item["name"].to_s.empty? &&
+      !item["call_id"].to_s.empty?
+  end
+
+  def duplicate_tool_call?(reference, candidate, model_name = nil)
+    collapsible_duplicate_tool_call?(reference, model_name) &&
+      collapsible_duplicate_tool_call?(candidate, model_name) &&
+      reference["name"].to_s == candidate["name"].to_s &&
+      reference["arguments"].to_s == candidate["arguments"].to_s
+  end
+
+  def duplicate_tool_dedupe_enabled?(tool_name, model_name)
+    ALWAYS_DEDUPED_TOOL_NAMES.include?(tool_name.to_s) || gemma_model?(model_name)
+  end
+
+  def gemma_model?(model_name)
+    model_name.to_s.downcase.include?("gemma")
   end
 
   def transient_assistant_message?(items, index)

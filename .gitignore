@@ -6,3 +6,4 @@ AGENTS.md
 src/.bundle/
 .idea/
 **/.knowledge/
+.codex
