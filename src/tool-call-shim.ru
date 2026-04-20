@@ -565,9 +565,11 @@ class Qwen3CoderToolCallShim < Sinatra::Base
   def normalize_responses_stream(raw_body, request_payload = nil)
     events = parse_sse(raw_body)
     completed_response = events.find { |event| event[:name] == "response.completed" }&.dig(:json, "response")
+    tool_schemas = tool_schema_map(request_payload)
+    response_model = response_model_name(request_payload, completed_response)
+    collapse_duplicate_response_function_calls!(completed_response, response_model, tool_schemas)
     message_item = Array(completed_response&.fetch("output", nil)).find { |item| item["type"] == "message" }
     completed_function_calls = Array(completed_response&.fetch("output", nil)).select { |item| item["type"] == "function_call" }
-    tool_schemas = tool_schema_map(request_payload)
     message_id = message_item&.fetch("id", nil) || "msg_#{SecureRandom.hex(8)}"
     message_output_index = Array(completed_response&.fetch("output", nil)).index(message_item)
 
@@ -582,6 +584,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     message_added = false
     function_call_states = {}
     function_call_order = []
+    suppressed_function_call_ids = {}
 
     emit = lambda do |name, payload|
       clean_payload = strip_nil_values(payload)
@@ -609,6 +612,10 @@ class Qwen3CoderToolCallShim < Sinatra::Base
         when "function_call"
           item = payload["item"]
           completed_item = completed_function_calls[function_call_order.length]
+          if suppress_response_function_call_item?(item, completed_item, completed_function_calls, function_call_order, response_model)
+            suppressed_function_call_ids[item["id"]] = true
+            next
+          end
           source_arguments = item["arguments"]
           source_arguments = completed_item&.dig("arguments") if source_arguments.to_s.empty?
           rewritten_name, rewritten_arguments = rewrite_tool_call(item["name"], source_arguments)
@@ -696,12 +703,16 @@ class Qwen3CoderToolCallShim < Sinatra::Base
           emit.call(name, payload)
         end
       when "response.function_call_arguments.delta"
+        next if suppressed_function_call_ids[payload["item_id"]]
+
         function_call_state = function_call_states[payload["item_id"]]
         next if function_call_state&.fetch("rewritten", false)
 
         function_call_state&.fetch("arguments")&.<< payload["delta"].to_s
         emit.call(name, payload)
       when "response.function_call_arguments.done"
+        next if suppressed_function_call_ids[payload["item_id"]]
+
         function_call_state = function_call_states[payload["item_id"]]
         if function_call_state
           function_call_state["arguments"] = function_call_arguments(function_call_state, tool_schemas)
@@ -720,6 +731,8 @@ class Qwen3CoderToolCallShim < Sinatra::Base
           message_done = true
           emit.call(name, message_done_event(message_id, message_output_index, text))
         when "function_call"
+          next if suppressed_function_call_ids[payload.dig("item", "id")]
+
           function_call_state = function_call_states.dig(payload.dig("item", "id"))
           if function_call_state
             function_call_state["arguments"] = function_call_arguments(function_call_state, tool_schemas)
@@ -742,6 +755,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
           )
           final_text = embedded_tool_call["remaining_text"].to_s
         end
+        function_call_order = collapse_duplicate_function_call_states(function_call_order, response_model, tool_schemas)
         suffix = +""
         if !text_started && !final_text.empty? && function_call_order.empty?
           suffix << emit.call("response.output_item.added", message_added_event(message_id, message_output_index))
@@ -771,7 +785,7 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     end.join
 
     log_stream_summary(text_started, upstream_message_added, text) if ENV["VLLM_SHIM_TOOL_CALL_DEBUG"]
-    normalized
+    finalize_normalized_stream(normalized, response_model, tool_schemas)
   rescue JSON::ParserError, TypeError
     raw_body
   end
@@ -856,6 +870,8 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     response = payload["response"]
     return payload unless response.is_a?(Hash)
 
+    function_call_states = collapse_duplicate_function_call_states(function_call_states, response["model"], tool_schemas)
+    collapse_duplicate_response_function_calls!(response, response["model"], tool_schemas)
     output = Array(response["output"])
     append_embedded_tool_call_items!(output, function_call_states, tool_schemas)
     promote_reasoning_only_completion!(payload, message_id, output_index, text) if output.none? { |item| item.is_a?(Hash) && item["type"] == "function_call" }
@@ -1237,14 +1253,170 @@ class Qwen3CoderToolCallShim < Sinatra::Base
     return payload unless response.is_a?(Hash)
 
     tool_schemas = tool_schema_map(request_payload)
-    Array(response["output"]).each do |item|
-      next unless item.is_a?(Hash) && item["type"] == "function_call"
-
-      item["name"], item["arguments"] = rewrite_tool_call(item["name"], item["arguments"])
-      item["arguments"] = normalize_tool_call_arguments(item["arguments"], item["name"], tool_schemas)
-    end
+    collapse_duplicate_response_function_calls!(response, response_model_name(request_payload, response), tool_schemas)
 
     payload
+  end
+
+  def response_model_name(request_payload, response = nil)
+    model_name = response.is_a?(Hash) ? response["model"] : nil
+    model_name = request_payload["model"] if model_name.to_s.empty? && request_payload.is_a?(Hash)
+    model_name
+  end
+
+  def collapse_duplicate_response_function_calls!(response, model_name, tool_schemas, preferred_call_ids = nil)
+    return unless response.is_a?(Hash) && response["output"].is_a?(Array)
+
+    seen_signatures = {}
+    response["output"] = response["output"].each_with_object([]) do |item, collapsed|
+      signature = normalize_response_function_call_item!(item, model_name, tool_schemas)
+      if signature && seen_signatures[signature]
+        preferred_call_id = preferred_call_ids.is_a?(Hash) ? preferred_call_ids[signature] : nil
+        if preferred_call_id && item["call_id"].to_s == preferred_call_id
+          collapsed[seen_signatures[signature]] = item
+        end
+        log_debug "dropped duplicate response function_call name=#{signature[0]} arguments=#{signature[1][0..200]}"
+        next
+      end
+
+      seen_signatures[signature] = collapsed.length if signature
+      collapsed << item
+    end
+  end
+
+  def normalize_response_function_call_item!(item, model_name, tool_schemas)
+    return unless item.is_a?(Hash) && item["type"] == "function_call"
+
+    item["name"], item["arguments"] = rewrite_tool_call(item["name"], item["arguments"])
+    item["arguments"] = normalize_tool_call_arguments(item["arguments"], item["name"], tool_schemas)
+    return unless duplicate_tool_dedupe_enabled?(item["name"], model_name)
+
+    [item["name"].to_s, item["arguments"].to_s]
+  end
+
+  def suppress_response_function_call_item?(item, completed_item, completed_function_calls, function_call_order, model_name)
+    return false unless item.is_a?(Hash)
+    return false if completed_item
+    return false if completed_function_calls.empty?
+    return false unless function_call_order.length >= completed_function_calls.length
+
+    duplicate_tool_dedupe_enabled?(item["name"], model_name)
+  end
+
+  def collapse_duplicate_function_call_states(function_call_states, model_name, tool_schemas)
+    Array(function_call_states).each_with_object([]) do |function_call_state, deduped_states|
+      signature = function_call_state_signature(function_call_state, model_name, tool_schemas)
+      unless signature
+        deduped_states << function_call_state
+        next
+      end
+
+      duplicate_index = deduped_states.index do |existing_state|
+        function_call_state_signature(existing_state, model_name, tool_schemas) == signature
+      end
+
+      if duplicate_index
+        deduped_states[duplicate_index] = preferred_function_call_state(
+          deduped_states[duplicate_index],
+          function_call_state,
+          tool_schemas
+        )
+      else
+        deduped_states << function_call_state
+      end
+    end
+  end
+
+  def function_call_state_signature(function_call_state, model_name, tool_schemas)
+    return unless function_call_state.is_a?(Hash)
+    return unless duplicate_tool_dedupe_enabled?(function_call_state["name"], model_name)
+
+    [function_call_state["name"].to_s, function_call_arguments(function_call_state, tool_schemas)]
+  end
+
+  def preferred_function_call_state(existing_state, candidate_state, tool_schemas)
+    existing_score = function_call_state_score(existing_state, tool_schemas)
+    candidate_score = function_call_state_score(candidate_state, tool_schemas)
+    return candidate_state if candidate_score >= existing_score
+
+    existing_state
+  end
+
+  def function_call_state_score(function_call_state, tool_schemas)
+    score = 0
+    score += 4 if function_call_state["item_done"]
+    score += 2 if function_call_state["arguments_done"]
+    score += 1 unless function_call_arguments(function_call_state, tool_schemas).empty?
+    score
+  end
+
+  def finalize_normalized_stream(normalized_stream, model_name, tool_schemas)
+    return normalized_stream unless gemma_model?(model_name)
+
+    events = parse_sse(normalized_stream)
+    completed_event = events.find { |event| event[:name] == "response.completed" && event[:json].is_a?(Hash) }
+    response = completed_event&.dig(:json, "response")
+    return normalized_stream unless response.is_a?(Hash)
+
+    preferred_call_ids = preferred_response_call_ids(events, model_name, tool_schemas)
+    collapse_duplicate_response_function_calls!(response, model_name, tool_schemas, preferred_call_ids)
+    kept_call_ids = Array(response["output"]).filter_map do |item|
+      item["call_id"].to_s if item.is_a?(Hash) && item["type"] == "function_call"
+    end
+    return normalized_stream if kept_call_ids.empty?
+
+    allowed_item_ids = {}
+    sequence_number = 0
+
+    events.filter_map do |event|
+      next event[:raw] unless event[:json].is_a?(Hash)
+
+      payload = event[:json].dup
+      name = event[:name] || payload["type"]
+
+      case name
+      when "response.output_item.added"
+        if payload.dig("item", "type") == "function_call"
+          call_id = payload.dig("item", "call_id").to_s
+          next unless kept_call_ids.include?(call_id)
+
+          item_id = payload.dig("item", "id").to_s
+          allowed_item_ids[item_id] = true unless item_id.empty?
+        end
+      when "response.function_call_arguments.delta", "response.function_call_arguments.done"
+        next unless allowed_item_ids[payload["item_id"].to_s]
+      when "response.output_item.done"
+        if payload.dig("item", "type") == "function_call"
+          next unless kept_call_ids.include?(payload.dig("item", "call_id").to_s)
+        end
+      when "response.completed"
+        payload["response"] = response
+      end
+
+      payload["sequence_number"] = sequence_number
+      sequence_number += 1
+      serialize_sse_event(name, payload)
+    end.join
+  rescue JSON::ParserError, TypeError
+    normalized_stream
+  end
+
+  def preferred_response_call_ids(events, model_name, tool_schemas)
+    events.each_with_object({}) do |event, preferred_call_ids|
+      next unless event[:name] == "response.output_item.done"
+      item = event.dig(:json, "item")
+      next unless item.is_a?(Hash) && item["type"] == "function_call"
+      next unless duplicate_tool_dedupe_enabled?(item["name"], model_name)
+
+      signature = [item["name"].to_s, normalize_tool_call_arguments(item["arguments"], item["name"], tool_schemas)]
+      preferred_call_ids[signature] = item["call_id"].to_s
+    end
+  end
+
+  def serialize_sse_event(name, payload)
+    clean_payload = strip_nil_values(payload)
+    clean_payload["type"] ||= name
+    "event: #{name}\ndata: #{JSON.generate(clean_payload)}\n\n"
   end
 
   def rewrite_tool_call(function_name, arguments)
